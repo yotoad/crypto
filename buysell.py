@@ -33,7 +33,7 @@ def calculate_ma(df, column='ratio', short_window=SHORT_WINDOW, long_window=LONG
     else:
         df['short_ma'] = df[column].rolling(window=short_window).mean()
         df['long_ma'] = df[column].rolling(window=long_window).mean()
-    df['signal'] = np.where(df['short_ma'] > df['long_ma'], 1, -1)  # 1 = BTC, -1 = ETH
+    df['signal'] = np.where(df['short_ma'] > df['long_ma'], 1, -1)
     return df
 
 # --- TELEGRAM ALERTS (Optional) ---
@@ -95,7 +95,7 @@ class LiveArbitrageBot:
 # --- LIVE DASHBOARD (Matplotlib) ---
 def live_dashboard(bot):
     plt.ion()  # Interactive mode
-    fig, ax = plt.subplots(figsize=(10, 5))
+    _, ax = plt.subplots(figsize=(10, 5))
     
     while True:
         if len(bot.historical_ratio) > LONG_WINDOW:
