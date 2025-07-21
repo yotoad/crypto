@@ -5,16 +5,27 @@ import time
 import requests
 from datetime import datetime
 import matplotlib.pyplot as plt
-from threading import Thread
+from threading import Thread, Lock
 
 # --- SETTINGS ---
 FEE = 0.015                     # Shakepay's ~1.5% spread
-SHORT_WINDOW = 10               # EMA/SMA short window
-LONG_WINDOW = 50                # EMA/SMA long window
+SHORT_WINDOW = 7               # EMA/SMA short window
+LONG_WINDOW = 30                 # EMA/SMA long window
 USE_EMA = True                  # Use EMA (True) or SMA (False)
-CHECK_INTERVAL = 3600           # Check every 1 hour (in seconds)
+CHECK_INTERVAL = 60           # Check every 1 hour (in seconds)
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Optional
 TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"               # Optional
+
+# --- GLOBALS (Thread-Safe) ---
+plot_data = {
+    'timestamps': [],
+    'ratio': [],
+    'short_ma': [],
+    'long_ma': [],
+    'signal': [],
+    'profit_btc': []  # Projected profit in BTC terms   
+}
+plot_lock = Lock()  # Prevent race conditions
 
 # --- INITIALIZE EXCHANGE (Binance) ---
 exchange = ccxt.binance()
@@ -26,13 +37,14 @@ def get_live_ratio():
     return btc_price / eth_price
 
 # --- MOVING AVERAGE CALCULATION ---
-def calculate_ma(df, column='ratio', short_window=SHORT_WINDOW, long_window=LONG_WINDOW, use_ema=USE_EMA):
+def calculate_ma(ratio_data, short_window=SHORT_WINDOW, long_window=LONG_WINDOW, use_ema=USE_EMA):
+    df = pd.DataFrame(ratio_data, columns=['ratio'])
     if use_ema:
-        df['short_ma'] = df[column].ewm(span=short_window, adjust=False).mean()
-        df['long_ma'] = df[column].ewm(span=long_window, adjust=False).mean()
+        df['short_ma'] = df['ratio'].ewm(span=short_window, adjust=False).mean()
+        df['long_ma'] = df['ratio'].ewm(span=long_window, adjust=False).mean()
     else:
-        df['short_ma'] = df[column].rolling(window=short_window).mean()
-        df['long_ma'] = df[column].rolling(window=long_window).mean()
+        df['short_ma'] = df['ratio'].rolling(window=short_window).mean()
+        df['long_ma'] = df['ratio'].rolling(window=long_window).mean()
     df['signal'] = np.where(df['short_ma'] > df['long_ma'], 1, -1)
     return df
 
@@ -40,28 +52,67 @@ def calculate_ma(df, column='ratio', short_window=SHORT_WINDOW, long_window=LONG
 def send_telegram_alert(message):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        params = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        }
+        params = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
         requests.post(url, params=params).json()
 
 # --- LIVE TRADING LOGIC ---
 class LiveArbitrageBot:
     def __init__(self):
         self.historical_ratio = pd.DataFrame(columns=['timestamp', 'ratio'])
-        self.current_btc = 1.0   # Your current BTC balance (edit this)
-        self.current_eth = 10.0  # Your current ETH balance (edit this)
+        self.current_btc = 0.00000609   # Your current BTC balance
+        self.current_eth = 0.002591871230724891  # Your current ETH balance
     
     def update_historical_data(self):
         ratio = get_live_ratio()
-        new_row = pd.DataFrame({
-            'timestamp': [datetime.now()],
-            'ratio': [ratio]
-        })
-        self.historical_ratio = pd.concat([self.historical_ratio, new_row], ignore_index=True)
-        return ratio
-    
+        new_row = pd.DataFrame({'timestamp': [datetime.now()], 'ratio': [ratio]})
+        
+        # Fix for FutureWarning: ensure consistent columns
+        if self.historical_ratio.empty:
+            self.historical_ratio = new_row
+        else:
+            self.historical_ratio = pd.concat(
+                [self.historical_ratio, new_row],
+                ignore_index=True,
+                axis=0,
+                join='inner'  # Only keep common columns
+            )
+        
+        with plot_lock:
+            plot_data['timestamps'].append(datetime.now())
+            plot_data['ratio'].append(ratio)
+            
+            if len(plot_data['ratio']) >= LONG_WINDOW:
+                ma_data = calculate_ma(plot_data['ratio'][-LONG_WINDOW:])
+                
+                # Ensure we don't append NaN if MA calculation fails
+                short_ma = ma_data['short_ma'].iloc[-1] if not ma_data.empty else np.nan
+                long_ma = ma_data['long_ma'].iloc[-1] if not ma_data.empty else np.nan
+                signal = ma_data['signal'].iloc[-1] if not ma_data.empty else np.nan
+                
+                plot_data['short_ma'].append(short_ma)
+                plot_data['long_ma'].append(long_ma)
+                plot_data['signal'].append(signal)
+                
+                # Safe profit calculation
+                if 'profit_btc' not in plot_data:
+                    plot_data['profit_btc'] = []
+                    
+                current_profit = 0
+                if signal == 1 and not np.isnan(signal):  # Hold BTC
+                    eth_held = self.current_eth
+                    current_profit = (eth_held * ratio) * (1 - FEE) - self.current_btc
+                elif signal == -1 and not np.isnan(signal):  # Hold ETH
+                    btc_held = self.current_btc
+                    current_profit = (btc_held / ratio) * (1 - FEE) * ratio - self.current_btc
+                    
+                plot_data['profit_btc'].append(current_profit)
+                
+            else:
+                plot_data['short_ma'].append(np.nan)
+                plot_data['long_ma'].append(np.nan)
+                plot_data['signal'].append(np.nan)
+                plot_data['profit_btc'].append(np.nan)
+                    
     def generate_signal(self):
         if len(self.historical_ratio) >= LONG_WINDOW:
             df = calculate_ma(self.historical_ratio.copy())
@@ -92,26 +143,51 @@ class LiveArbitrageBot:
                 print(f"⚠️ Error: {e}")
                 time.sleep(60)
 
-# --- LIVE DASHBOARD (Matplotlib) ---
-def live_dashboard(bot):
-    plt.ion()  # Interactive mode
-    _, ax = plt.subplots(figsize=(10, 5))
+# --- LIVE DASHBOARD (Main Thread) ---
+def live_dashboard():
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     while True:
-        if len(bot.historical_ratio) > LONG_WINDOW:
-            df = calculate_ma(bot.historical_ratio.copy())
-            ax.clear()
-            ax.plot(df['timestamp'], df['ratio'], label='BTC/ETH Ratio', color='blue')
-            ax.plot(df['timestamp'], df['short_ma'], label=f'Short MA ({SHORT_WINDOW})', color='orange')
-            ax.plot(df['timestamp'], df['long_ma'], label=f'Long MA ({LONG_WINDOW})', color='green')
-            
-            # Highlight buy/sell signals
-            ax.fill_between(df['timestamp'], df['ratio'], where=(df['signal'] == 1), color='green', alpha=0.3)
-            ax.fill_between(df['timestamp'], df['ratio'], where=(df['signal'] == -1), color='red', alpha=0.3)
-            
-            ax.set_title('Live BTC/ETH Arbitrage Dashboard')
-            ax.legend()
-            plt.pause(60)  # Update every 60 seconds
+        with plot_lock:
+            if len(plot_data['timestamps']) > 1:
+                ax.clear()
+                
+                # Plot Ratio and MAs
+                ax.plot(plot_data['timestamps'], plot_data['ratio'], label='BTC/ETH Ratio', color='blue', linewidth=2)
+                ax.plot(plot_data['timestamps'], plot_data['short_ma'], label=f'Short MA ({SHORT_WINDOW})', color='orange', linestyle='--')
+                ax.plot(plot_data['timestamps'], plot_data['long_ma'], label=f'Long MA ({LONG_WINDOW})', color='green', linestyle='--')
+                
+                # Highlight signals
+                ax.fill_between(
+                    plot_data['timestamps'],
+                    min(plot_data['ratio']),
+                    max(plot_data['ratio']),
+                    where=(np.array(plot_data['signal']) == 1),
+                    color='green', alpha=0.2, label='Hold BTC'
+                )
+                ax.fill_between(
+                    plot_data['timestamps'],
+                    min(plot_data['ratio']),
+                    max(plot_data['ratio']),
+                    where=(np.array(plot_data['signal']) == -1),
+                    color='red', alpha=0.2, label='Hold ETH'
+                )
+                
+                # Add profit annotations (if available)
+                if 'profit_btc' in plot_data:
+                    last_profit = plot_data['profit_btc'][-1]
+                    ax.annotate(
+                        f"Projected Profit: {last_profit:.4f} BTC",
+                        xy=(plot_data['timestamps'][-1], plot_data['ratio'][-1]),
+                        xytext=(10, 10), textcoords='offset points',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5)
+                    )
+                
+                ax.set_title('BTC/ETH Arbitrage Dashboard (Live)')
+                ax.legend(loc='upper left')
+                ax.grid(True)
+                plt.pause(1)
 
 # --- START THE BOT ---
 if __name__ == "__main__":
@@ -122,11 +198,5 @@ if __name__ == "__main__":
     trading_thread.daemon = True
     trading_thread.start()
     
-    # Start live dashboard (optional)
-    dashboard_thread = Thread(target=live_dashboard, args=(bot,))
-    dashboard_thread.daemon = True
-    dashboard_thread.start()
-    
-    # Keep main thread alive
-    while True:
-        time.sleep(1)
+    # Start live dashboard in main thread
+    live_dashboard()
