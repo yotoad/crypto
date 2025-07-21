@@ -13,8 +13,8 @@ SHORT_WINDOW = 7               # EMA/SMA short window
 LONG_WINDOW = 30                 # EMA/SMA long window
 USE_EMA = True                  # Use EMA (True) or SMA (False)
 CHECK_INTERVAL = 60           # Check every 1 hour (in seconds)
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Optional
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"               # Optional
+TELEGRAM_BOT_TOKEN = "7326321585:AAGhFHTqnK-r4ce0NBHceBJLC649KV21qG8"  # Optional
+TELEGRAM_CHAT_ID = "1255286244"               # Optional
 
 # --- GLOBALS (Thread-Safe) ---
 plot_data = {
@@ -61,6 +61,7 @@ class LiveArbitrageBot:
         self.historical_ratio = pd.DataFrame(columns=['timestamp', 'ratio'])
         self.current_btc = 0.00000609   # Your current BTC balance
         self.current_eth = 0.002591871230724891  # Your current ETH balance
+        self.current_profit = 0.0
     
     def update_historical_data(self):
         ratio = get_live_ratio()
@@ -97,15 +98,14 @@ class LiveArbitrageBot:
                 if 'profit_btc' not in plot_data:
                     plot_data['profit_btc'] = []
                     
-                current_profit = 0
                 if signal == 1 and not np.isnan(signal):  # Hold BTC
                     eth_held = self.current_eth
-                    current_profit = (eth_held * ratio) * (1 - FEE) - self.current_btc
+                    self.current_profit = (eth_held * ratio) * (1 - FEE) - self.current_btc
                 elif signal == -1 and not np.isnan(signal):  # Hold ETH
                     btc_held = self.current_btc
-                    current_profit = (btc_held / ratio) * (1 - FEE) * ratio - self.current_btc
+                    self.current_profit = (btc_held / ratio) * (1 - FEE) * ratio - self.current_btc
                     
-                plot_data['profit_btc'].append(current_profit)
+                plot_data['profit_btc'].append(self.current_profit)
                 
             else:
                 plot_data['short_ma'].append(np.nan)
@@ -122,15 +122,17 @@ class LiveArbitrageBot:
             if latest_signal == 1:  # Favor BTC
                 if self.current_eth > 0:
                     btc_gain = (self.current_eth * latest_ratio) * (1 - FEE)
-                    alert_msg = f"🚀 [SWAP] ETH → BTC | Gain: {btc_gain:.6f} BTC | Ratio: {latest_ratio:.4f}"
+                    alert_msg = f"🚀 [SWAP] ETH → BTC | Gain: {btc_gain:.6f} BTC | Ratio: {latest_ratio:.4f} | Potential Profit: {self.current_profit:.2f}"
                     print(alert_msg)
-                    send_telegram_alert(alert_msg)
+                    if self.current_profit > 0.01:
+                        send_telegram_alert(alert_msg)
             else:  # Favor ETH
                 if self.current_btc > 0:
                     eth_gain = (self.current_btc / latest_ratio) * (1 - FEE)
-                    alert_msg = f"💎 [SWAP] BTC → ETH | Gain: {eth_gain:.6f} ETH | Ratio: {latest_ratio:.4f}"
+                    alert_msg = f"💎 [SWAP] BTC → ETH | Gain: {eth_gain:.6f} ETH | Ratio: {latest_ratio:.4f} | Potential Profit: {self.current_profit:.2f}"
                     print(alert_msg)
-                    send_telegram_alert(alert_msg)
+                    if self.current_profit > 0.01:
+                        send_telegram_alert(alert_msg)
     
     def run_live(self):
         print("🚀 Starting Live BTC/ETH Arbitrage Bot...")
